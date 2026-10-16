@@ -925,3 +925,131 @@ mod rewrite_host_scoping {
         assert!(!denied.recorded_a_recall());
     }
 }
+
+/// #3970: `rtk rewrite` must not auto-allow (exit 0) an rtk-prefixed command
+/// whose executed payload is denied. Settings: allow `rtk:*`, deny `rm:*`.
+///
+/// These fail on current develop (exit 0 / identity rewrite) and pin the
+/// CLI contract the fix must restore: inner deny → exit 2.
+mod rtk_prefixed_verdict {
+    use super::Sandbox;
+
+    fn deny_rm_allow_rtk() -> Sandbox {
+        Sandbox::with_rules(&["rm:*"], &[], &["rtk:*", "ls:*", "cat:*", "git:*"])
+    }
+
+    #[test]
+    fn rewrite_denies_rtk_prefixed_rm_passthrough() {
+        let sb = deny_rm_allow_rtk();
+        for cmd in [
+            "rtk rm X",
+            "rtk rtk rm X",
+            "rtk proxy rtk rm X",
+            "rtk proxy --ultra-compact rm X",
+            "rtk run rm X",
+            "rtk run -c 'rm X'",
+            "rtk run --shell bash -c 'rm X'",
+            "rtk run --ultra-compact rm X",
+            "ls && rtk rm X",
+            "rtk ls; rtk rm X",
+            "rtk rm X | cat",
+            "FOO=1 rtk rm X",
+            "env rtk rm X",
+            "command rtk rm X",
+            "exec rtk rm X",
+            "sudo rtk rm X",
+            "/usr/local/bin/rtk rm X",
+            "./rtk rm X",
+            "\"rtk\" rm X",
+            "rtk rm X > /dev/null",
+        ] {
+            let (code, stdout) = sb.rewrite(cmd);
+            assert_ne!(
+                code, 0,
+                "must not auto-allow rtk-prefixed deny bypass: {cmd} (stdout={stdout:?})"
+            );
+            assert_eq!(
+                code, 2,
+                "inner deny must be exit 2 for rewrite CLI: {cmd} (stdout={stdout:?})"
+            );
+            assert!(
+                stdout.is_empty(),
+                "deny must print nothing: {cmd} got {stdout:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rewrite_never_allows_unjudged_or_ask_inner() {
+        // ask rm:*
+        let ask = Sandbox::with_rules(&[], &["rm:*"], &["rtk:*"]);
+        for cmd in [
+            "rtk rm X",
+            "rtk proxy rm X",
+            "rtk run rm X",
+            "rtk run -c 'rm X'",
+        ] {
+            let (code, stdout) = ask.rewrite(cmd);
+            assert_ne!(code, 0, "ask-inner must not auto-allow: {cmd}");
+            assert_eq!(
+                code, 3,
+                "ask-inner should exit 3: {cmd} (stdout={stdout:?})"
+            );
+        }
+        // no rule on rm — unjudged inner → Ask (3), never Allow (0)
+        let bare_inner = Sandbox::with_rules(&[], &[], &["rtk:*"]);
+        for cmd in ["rtk rm X", "rtk proxy rm X", "rtk run rm X"] {
+            let (code, _) = bare_inner.rewrite(cmd);
+            assert_ne!(code, 0, "unjudged inner must not auto-allow: {cmd}");
+        }
+    }
+
+    #[test]
+    fn rewrite_substitutions_never_auto_allow_denied_inner() {
+        let sb = deny_rm_allow_rtk();
+        for cmd in [
+            "echo $(rtk rm X)",
+            "echo `rtk rm X`",
+            "rtk rm X <<EOF\nok\nEOF",
+        ] {
+            let (code, stdout) = sb.rewrite(cmd);
+            assert_ne!(
+                code, 0,
+                "substitution/heredoc with denied inner must not auto-allow: {cmd} (stdout={stdout:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn rewrite_keeps_allowed_rtk_native_and_inners() {
+        let sb = deny_rm_allow_rtk();
+        // Identity rewrite, auto-allowed because outer and executed judgment agree.
+        assert_eq!(sb.rewrite("rtk git status"), (0, "rtk git status".into()));
+        assert_eq!(sb.rewrite("rtk gain"), (0, "rtk gain".into()));
+        assert_eq!(sb.rewrite("rtk read f"), (0, "rtk read f".into()));
+        // Bare deny still denies.
+        assert_eq!(sb.rewrite("rm X"), (2, String::new()));
+    }
+
+    #[test]
+    fn hook_claude_does_not_defer_into_host_auto_allow_for_prefixed_deny() {
+        // In-process hook suppresses identity rewrites to Defer; with an inner
+        // deny the decision must be Deny (or an AskRewrite of the unwrapped
+        // command) — never a silent Defer that lets Bash(rtk:*) auto-allow.
+        let sb = deny_rm_allow_rtk();
+        let stdout = sb.hook_claude("rtk rm /tmp/evil");
+        assert!(
+            !stdout.is_empty(),
+            "hook must not silently defer a denied rtk-prefixed command (empty=Defer)"
+        );
+        // Claude deny shape carries permissionDecision deny, or updatedInput
+        // with the unwrapped command for the host to re-evaluate.
+        assert!(
+            stdout.contains("deny")
+                || stdout.contains("\"rm ")
+                || stdout.contains("updatedInput")
+                || stdout.contains("ask"),
+            "expected a host-visible deny/ask/unwrap, got: {stdout}"
+        );
+    }
+}

@@ -2404,4 +2404,139 @@ mod tests {
             PermissionVerdict::Ask
         );
     }
+
+    // -------------------------------------------------------------------------
+    // #3970: permission verdict must follow the command rtk actually executes.
+    // An allow for `rtk:*` must not hide a deny/ask on the inner passthrough,
+    // proxy, or run payload. These assertions fail on current develop (outer
+    // `rtk …` matches `rtk:*` → Allow) and pin the contract for the fix.
+    // -------------------------------------------------------------------------
+
+    fn rtk_allow_rm_deny() -> (Vec<String>, Vec<String>, Vec<String>) {
+        (vec!["rm:*".to_string()], vec![], vec!["rtk:*".to_string()])
+    }
+
+    /// Commands whose executed payload is (or nests) a denied `rm`.
+    /// After the fix each must be Deny — never Allow via `Bash(rtk:*)`.
+    fn rtk_prefixed_rm_deny_cases() -> &'static [&'static str] {
+        &[
+            "rtk rm X",
+            "rtk rtk rm X",
+            "rtk proxy rtk rm X",
+            "rtk proxy --ultra-compact rm X",
+            "rtk run rm X",
+            "rtk run -c 'rm X'",
+            "rtk run --shell bash -c 'rm X'",
+            "rtk run --ultra-compact rm X",
+            "ls && rtk rm X",
+            "rtk ls; rtk rm X",
+            "rtk rm X | cat",
+            "FOO=1 rtk rm X",
+            "env rtk rm X",
+            "command rtk rm X",
+            "exec rtk rm X",
+            "sudo rtk rm X",
+            "/usr/local/bin/rtk rm X",
+            "./rtk rm X",
+            "\"rtk\" rm X",
+            "rtk rm X > /dev/null",
+        ]
+    }
+
+    #[test]
+    fn rtk_prefixed_passthrough_with_inner_deny_is_deny_not_allow() {
+        let (deny, ask, _) = rtk_allow_rm_deny();
+        // Also allow ls/cat so compound forms aren't Default for the outer side.
+        let allow = vec!["rtk:*".to_string(), "ls:*".to_string(), "cat:*".to_string()];
+        for cmd in rtk_prefixed_rm_deny_cases() {
+            let verdict = check_command_with_rules(cmd, &deny, &ask, &allow);
+            assert_ne!(
+                verdict,
+                PermissionVerdict::Allow,
+                "must never auto-allow via rtk:* when inner is denied: {cmd}"
+            );
+            assert_eq!(
+                verdict,
+                PermissionVerdict::Deny,
+                "inner deny must surface as Deny (not Ask/Default/Defer): {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn rtk_prefixed_with_ask_inner_is_ask_never_allow() {
+        let ask = vec!["rm:*".to_string()];
+        let allow = vec!["rtk:*".to_string()];
+        for cmd in [
+            "rtk rm X",
+            "rtk proxy rm X",
+            "rtk run rm X",
+            "rtk run -c 'rm X'",
+            "rtk rtk rm X",
+        ] {
+            let verdict = check_command_with_rules(cmd, &[], &ask, &allow);
+            assert_ne!(
+                verdict,
+                PermissionVerdict::Allow,
+                "ask on inner must not be swallowed by rtk:* allow: {cmd}"
+            );
+            assert_eq!(
+                verdict,
+                PermissionVerdict::Ask,
+                "inner ask must surface as Ask: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn rtk_prefixed_with_no_inner_rule_is_not_allow() {
+        // Outer matches rtk:*; inner `rm` matches nothing → must not Allow.
+        let allow = vec!["rtk:*".to_string()];
+        for cmd in [
+            "rtk rm X",
+            "rtk proxy rm X",
+            "rtk run rm X",
+            "rtk run -c 'rm X'",
+        ] {
+            let verdict = check_command_with_rules(cmd, &[], &[], &allow);
+            assert_ne!(
+                verdict,
+                PermissionVerdict::Allow,
+                "unjudged inner must never Allow: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn rtk_prefixed_substitutions_never_allow_when_inner_denied() {
+        let (deny, ask, allow) = rtk_allow_rm_deny();
+        // Unparseable / unattestable → Ask is acceptable; Allow is not.
+        for cmd in [
+            "echo $(rtk rm X)",
+            "echo `rtk rm X`",
+            "rtk rm X <<EOF\nok\nEOF",
+        ] {
+            let verdict = check_command_with_rules(cmd, &deny, &ask, &allow);
+            assert_ne!(
+                verdict,
+                PermissionVerdict::Allow,
+                "unjudged/unattestable with denied inner must not Allow: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn rtk_native_and_allowed_inners_stay_allowed() {
+        let allow = vec!["rtk:*".to_string(), "git:*".to_string()];
+        for cmd in ["rtk git status", "rtk gain", "rtk read f"] {
+            assert_eq!(
+                check_command_with_rules(cmd, &[], &[], &allow),
+                PermissionVerdict::Allow,
+                "benign rtk-native / allowed-inner must stay Allow: {cmd}"
+            );
+        }
+        // Text must remain the rtk form (identity rewrite), not collapse to
+        // bare `gain` / `read f`. That is pinned by rewrite_command, not by
+        // the permission verdict — see rewrite_cmd::test_run_already_rtk_returns_some.
+    }
 }

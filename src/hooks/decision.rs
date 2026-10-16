@@ -817,4 +817,38 @@ mod tests {
             assert_eq!(ApprovalOwner::from_env(), ApprovalOwner::Rtk);
         });
     }
+
+    /// #3970: composing the permission gate with `decide` must not auto-allow
+    /// an rtk-prefixed passthrough whose executed command is denied.
+    #[test]
+    fn rtk_prefixed_passthrough_deny_composes_to_hook_deny() {
+        use super::super::permissions::{PermissionVerdict, check_command_with_rules};
+
+        let deny = vec!["rm:*".to_string()];
+        let allow = vec!["rtk:*".to_string()];
+        for cmd in [
+            "rtk rm file",
+            "rtk proxy rm file",
+            "rtk run rm file",
+            "rtk run -c 'rm file'",
+            "rtk rtk rm file",
+        ] {
+            let verdict = check_command_with_rules(cmd, &deny, &[], &allow);
+            assert_ne!(
+                verdict,
+                PermissionVerdict::Allow,
+                "permission gate must not Allow: {cmd}"
+            );
+            assert_eq!(
+                verdict,
+                PermissionVerdict::Deny,
+                "permission gate must Deny: {cmd}"
+            );
+            assert_eq!(
+                decide_with_params(cmd, verdict, &[], &[]),
+                HookDecision::Deny,
+                "decide must stay Deny: {cmd}"
+            );
+        }
+    }
 }
