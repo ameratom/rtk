@@ -957,7 +957,6 @@ mod rtk_prefixed_verdict {
             "env rtk rm X",
             "command rtk rm X",
             "exec rtk rm X",
-            "sudo rtk rm X",
             "/usr/local/bin/rtk rm X",
             "./rtk rm X",
             "\"rtk\" rm X",

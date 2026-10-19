@@ -646,7 +646,24 @@ enum PayloadAction {
         reason: &'static str,
         cmd: String,
     },
+    /// A deny rule matched the command behind an `rtk` prefix (#3970). The
+    /// host's own deny judges the literal `rtk …` text and cannot see it, so
+    /// the hook has to say deny itself.
+    Deny {
+        cmd: String,
+        output: Value,
+    },
     Ignore,
+}
+
+fn pre_tool_use_deny_output() -> Value {
+    json!({
+        "hookSpecificOutput": {
+            "hookEventName": PRE_TOOL_USE_KEY,
+            "permissionDecision": "deny",
+            "permissionDecisionReason": "RTK: a deny rule matches the command behind the rtk prefix"
+        }
+    })
 }
 
 fn pre_tool_use_rewrite_output(
@@ -699,6 +716,12 @@ fn process_claude_payload_from_decision(
     decision: HookDecision,
 ) -> PayloadAction {
     let (rewritten, allow) = match decision {
+        HookDecision::Deny if permissions::behind_rtk_prefix(cmd) => {
+            return PayloadAction::Deny {
+                cmd: cmd.to_string(),
+                output: pre_tool_use_deny_output(),
+            };
+        }
         HookDecision::Deny => {
             return PayloadAction::Skip {
                 decision: HookOutcome::Deny,
@@ -835,6 +858,11 @@ pub fn run_claude() -> Result<()> {
             audit_log(reason, &cmd, "");
             log_hook_decision(&v, &cmd, decision, None);
         }
+        PayloadAction::Deny { cmd, output } => {
+            let _ = writeln!(io::stdout(), "{output}");
+            audit_log("deny", &cmd, "");
+            log_hook_decision(&v, &cmd, HookOutcome::Deny, None);
+        }
         PayloadAction::Ignore => {}
     }
 
@@ -846,7 +874,9 @@ fn run_claude_inner(input: &str) -> Option<String> {
     let input = strip_leading_bom(input);
     let v: Value = serde_json::from_str(input).ok()?;
     match process_claude_payload(&v) {
-        PayloadAction::Rewrite { output, .. } => Some(output.to_string()),
+        PayloadAction::Rewrite { output, .. } | PayloadAction::Deny { output, .. } => {
+            Some(output.to_string())
+        }
         _ => None,
     }
 }
@@ -1051,6 +1081,10 @@ pub fn run_codex() -> Result<()> {
             let _ = writeln!(io::stdout(), "{output}");
         }
         PayloadAction::Skip { cmd, reason, .. } => audit_log(reason, &cmd, ""),
+        PayloadAction::Deny { cmd, output } => {
+            audit_log("deny", &cmd, "");
+            let _ = writeln!(io::stdout(), "{output}");
+        }
         PayloadAction::Ignore => {}
     }
 

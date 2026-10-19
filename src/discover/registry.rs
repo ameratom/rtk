@@ -2158,26 +2158,43 @@ fn strip_wrapper_prefix_from_any<'a>(
 /// allow rule.
 pub(crate) fn matching_readings(cmd: &str) -> MatchingReadings<'_> {
     let mut readings = vec![cmd.trim()];
+    let mut executed = Vec::new();
     let mut rest = cmd.trim();
+    let done = |readings, executed, complete| MatchingReadings {
+        readings,
+        executed,
+        complete,
+    };
     loop {
         let before = rest;
-        for step in [PeelStep::Assignments, PeelStep::Keyword, PeelStep::Wrapper] {
-            if let Some(inner) = step.peel(rest) {
+        for step in [
+            PeelStep::Assignments,
+            PeelStep::Keyword,
+            PeelStep::Wrapper,
+            PeelStep::Rtk,
+        ] {
+            let inner = match step {
+                PeelStep::Rtk => match peel_rtk(rest) {
+                    None => None,
+                    Some(RtkPeel::Unreadable) => return done(readings, executed, false),
+                    Some(RtkPeel::Native(inner)) => Some(inner),
+                    Some(RtkPeel::Passthrough(inner)) => {
+                        executed.push(inner);
+                        Some(inner)
+                    }
+                },
+                _ => step.peel(rest),
+            };
+            if let Some(inner) = inner {
                 if readings.len() > MAX_MATCHING_PEELS {
-                    return MatchingReadings {
-                        readings,
-                        complete: false,
-                    };
+                    return done(readings, executed, false);
                 }
                 rest = inner;
                 readings.push(rest);
             }
         }
         if rest == before {
-            return MatchingReadings {
-                readings,
-                complete: true,
-            };
+            return done(readings, executed, true);
         }
     }
 }
@@ -2189,6 +2206,9 @@ enum PeelStep {
     Assignments,
     Keyword,
     Wrapper,
+    /// An `rtk` prefix and the subcommand that hands its command on
+    /// ([`peel_rtk`], #3970).
+    Rtk,
 }
 
 impl PeelStep {
@@ -2204,6 +2224,10 @@ impl PeelStep {
                 strip_wrapper_prefix_from_any(&[PROCESS_WRAPPERS, MATCH_ONLY_WRAPPERS], cmd)
                     .map(|(_, inner)| inner)
             }
+            PeelStep::Rtk => match peel_rtk(cmd)? {
+                RtkPeel::Native(inner) | RtkPeel::Passthrough(inner) => Some(inner),
+                RtkPeel::Unreadable => None,
+            },
         }
     }
 }
@@ -2224,9 +2248,141 @@ pub(crate) const MAX_MATCHING_PEELS: usize = 32;
 /// make the verdict stricter.
 pub(crate) struct MatchingReadings<'a> {
     pub(crate) readings: Vec<&'a str>,
+    /// The commands an `rtk` prefix in the line only passes through or runs
+    /// on request (`rm x` in `rtk rm x`, `rtk bypass rm x`, `rtk run rm x`),
+    /// outermost first. An allow rule for the line as written does not cover
+    /// them; each needs one of its own (#3970).
+    pub(crate) executed: Vec<&'a str>,
     /// False when the peel stopped at [`MAX_MATCHING_PEELS`] with prefixes
-    /// left: the innermost command was not read.
+    /// left, or at an `rtk` line whose executed command cannot be read
+    /// ([`RtkPeel::Unreadable`]): the innermost command was not read.
     pub(crate) complete: bool,
+}
+
+/// What an `rtk …` line hands to the system once rtk parses it (#3970).
+///
+/// A deny or ask rule names the command that runs, and behind an `rtk`
+/// prefix that is not the text as written: `rtk rm x` falls back to running
+/// `rm x`, `rtk bypass rm x` (alias `proxy`) and `rtk run rm x` run it on
+/// request, and `rtk run -c 'rm x'` hands the script to a shell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RtkPeel<'a> {
+    /// One of rtk's own subcommands or filters (`rtk gain`, `rtk git status`);
+    /// the text from the subcommand on. `Bash(rtk:*)` still grants these.
+    Native(&'a str),
+    /// A command rtk only passes through or runs on request; the command it
+    /// runs. It needs an allow rule of its own.
+    Passthrough(&'a str),
+    /// An `rtk` line whose executed command cannot be read back as one plain
+    /// command (a `run -c` script with operators, a quoted script that is not
+    /// literal text). Never allowed; asks.
+    Unreadable,
+}
+
+/// Every subcommand name and alias rtk's own parser accepts.
+static RTK_SUBCOMMANDS: LazyLock<Vec<String>> = LazyLock::new(|| {
+    crate::rtk_command()
+        .get_subcommands()
+        .flat_map(|sub| {
+            std::iter::once(sub.get_name().to_string())
+                .chain(sub.get_all_aliases().map(str::to_string))
+        })
+        .collect()
+});
+
+/// Peel one `rtk` invocation off the front of `cmd`; `None` when `cmd` does
+/// not start with an `rtk` that runs something.
+pub(crate) fn peel_rtk(cmd: &str) -> Option<RtkPeel<'_>> {
+    let tokens = tokenize(cmd);
+    let first = tokens.first()?;
+    if first.kind != TokenKind::Arg || command_basename(unquoted_word(&first.value)) != "rtk" {
+        return None;
+    }
+    // rtk's global flags (`-v`, `--skip-env`) read before the subcommand.
+    let mut idx = 1;
+    while arg_token(&tokens, idx).is_some_and(|t| t.value.starts_with('-')) {
+        idx += 1;
+    }
+    let sub = arg_token(&tokens, idx)?;
+    let rest_from = |token: &ParsedToken| cmd[token.offset..].trim();
+    match sub.value.as_str() {
+        "bypass" | "proxy" => {
+            let mut idx = idx + 1;
+            while arg_token(&tokens, idx).is_some_and(|t| t.value.starts_with('-')) {
+                idx += 1;
+            }
+            arg_token(&tokens, idx).map(|t| RtkPeel::Passthrough(rest_from(t)))
+        }
+        "run" => {
+            let mut idx = idx + 1;
+            loop {
+                let token = arg_token(&tokens, idx)?;
+                let arg = token.value.as_str();
+                if arg == "-c" || arg == "--command" {
+                    let script = arg_token(&tokens, idx + 1)?;
+                    return Some(script_reading(cmd, script));
+                }
+                if arg.starts_with("--command=") {
+                    return Some(RtkPeel::Unreadable);
+                }
+                if arg == "--shell" {
+                    idx += 2;
+                    continue;
+                }
+                if arg.starts_with('-') {
+                    idx += 1;
+                    continue;
+                }
+                return Some(RtkPeel::Passthrough(rest_from(token)));
+            }
+        }
+        name if RTK_SUBCOMMANDS.iter().any(|known| known == name) => {
+            Some(RtkPeel::Native(rest_from(sub)))
+        }
+        _ => Some(RtkPeel::Passthrough(rest_from(sub))),
+    }
+}
+
+/// `word` without one pair of surrounding quotes (`"rtk"` is `rtk`).
+fn unquoted_word(word: &str) -> &str {
+    ['"', '\'']
+        .iter()
+        .find_map(|quote| {
+            word.strip_prefix(*quote)
+                .and_then(|inner| inner.strip_suffix(*quote))
+        })
+        .unwrap_or(word)
+}
+
+/// The script behind `rtk run -c`, as text a rule can be matched against, or
+/// [`RtkPeel::Unreadable`] when it is not one plain command written literally.
+fn script_reading<'a>(cmd: &'a str, token: &ParsedToken) -> RtkPeel<'a> {
+    // `tokenize` keeps a word's quotes, so the word's own text is the slice
+    // of `cmd` at its offset; read it back only where quoting is literal.
+    let Some(raw) = cmd.get(token.offset..token.offset + token.value.len()) else {
+        return RtkPeel::Unreadable;
+    };
+    let bytes = raw.as_bytes();
+    let literal = match bytes.first() {
+        Some(b'\'') if raw.len() >= 2 && raw.ends_with('\'') => {
+            Some(&raw[1..raw.len() - 1]).filter(|text| !text.contains('\''))
+        }
+        Some(b'"') if raw.len() >= 2 && raw.ends_with('"') => {
+            Some(&raw[1..raw.len() - 1]).filter(|text| !text.contains(['"', '\\', '$', '`']))
+        }
+        _ => Some(raw).filter(|text| !text.contains(['\'', '"', '\\', '$', '`'])),
+    };
+    let Some(script) = literal.map(str::trim) else {
+        return RtkPeel::Unreadable;
+    };
+    let plain = tokenize(script)
+        .iter()
+        .all(|t| matches!(t.kind, TokenKind::Arg | TokenKind::Redirect));
+    if script.is_empty() || !plain {
+        RtkPeel::Unreadable
+    } else {
+        RtkPeel::Passthrough(script)
+    }
 }
 
 fn inner_index(tokens: &[ParsedToken], inner: &ParsedToken) -> usize {

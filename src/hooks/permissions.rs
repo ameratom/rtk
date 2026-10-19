@@ -126,13 +126,19 @@ pub(crate) fn check_command_with_rules_and_prefixes(
     // too. Allow does not get these readings, so they can never make a
     // verdict looser. With no deny or ask rule there is nothing to read them
     // for, and none are taken.
+    //
+    // Behind an `rtk` prefix the readings also hold the command rtk hands on
+    // (#3970): `rtk rm x` is `rm x` to a deny or ask rule, and to allow it
+    // needs a rule of its own, since `Bash(rtk:*)` grants rtk's own commands
+    // and filters, not whatever rtk passes through or runs on request.
     let reads_past_prefixes = !deny_rules.is_empty() || !ask_rules.is_empty();
+    let reads_rtk_inners = !allow_rules.is_empty();
     let readings: Vec<(&str, Option<MatchingReadings<'_>>)> = segments
         .iter()
         .map(|segment| {
             let segment = segment.trim();
-            let peeled =
-                reads_past_prefixes.then(|| matching_readings(strip_grammar_residue(segment)));
+            let peeled = (reads_past_prefixes || reads_rtk_inners)
+                .then(|| matching_readings(strip_grammar_residue(segment)));
             (segment, peeled)
         })
         .collect();
@@ -185,7 +191,8 @@ pub(crate) fn check_command_with_rules_and_prefixes(
         // A segment whose prefixes ran past the peel's cap hides a command
         // no deny or ask rule was matched against, so it asks too.
         if !any_ask {
-            any_ask = peeled.as_ref().is_some_and(|peeled| !peeled.complete)
+            any_ask = (reads_past_prefixes
+                && peeled.as_ref().is_some_and(|peeled| !peeled.complete))
                 || ask_rules
                     .iter()
                     .any(|pattern| matches_any(segment, peeled, pattern));
@@ -194,9 +201,18 @@ pub(crate) fn check_command_with_rules_and_prefixes(
         // Allow — every non-empty segment must match an allow rule independently.
         // As soon as one segment fails to match, the entire chain loses Allow status.
         if all_segments_allowed {
-            let matched = allow_rules
-                .iter()
-                .any(|pattern| command_matches_pattern(segment, pattern));
+            let allowed = |command: &str| {
+                allow_rules
+                    .iter()
+                    .any(|pattern| command_matches_pattern(command, pattern))
+            };
+            // What an `rtk` prefix passes through needs its own allow rule,
+            // and an `rtk` line whose command could not be read is never
+            // allowed (#3970).
+            let matched = allowed(segment)
+                && peeled.as_ref().is_none_or(|peeled| {
+                    peeled.complete && peeled.executed.iter().all(|inner| allowed(inner))
+                });
             if !matched {
                 all_segments_allowed = false;
             }
@@ -212,6 +228,33 @@ pub(crate) fn check_command_with_rules_and_prefixes(
     } else {
         PermissionVerdict::Default
     }
+}
+
+/// Whether the gate read any segment of `cmd` past an `rtk` prefix, so a
+/// verdict on it may rest on a command the host cannot see in the text
+/// (#3970).
+pub(crate) fn behind_rtk_prefix(cmd: &str) -> bool {
+    split_compound_command(cmd).iter().any(|segment| {
+        matching_readings(strip_grammar_residue(segment.trim()))
+            .readings
+            .iter()
+            .any(|reading| registry::peel_rtk(reading).is_some())
+    })
+}
+
+/// Whether an `rtk` prefix in `cmd` hands a command on that rtk does not
+/// judge as its own: one it passes through or runs on request (`rtk rm x`,
+/// `rtk bypass …`, `rtk run …`), or one it could not read (#3970).
+///
+/// Such a command rewrites to itself, and a hook that suppresses the no-op
+/// leaves the host to judge the literal `rtk …` text, which `Bash(rtk:*)`
+/// auto-allows. [`decide_for_agent_at`](super::decision::decide_for_agent_at)
+/// keeps the prompt for these instead.
+pub(crate) fn hands_on_rtk_command(cmd: &str) -> bool {
+    split_compound_command(cmd).iter().any(|segment| {
+        let peeled = matching_readings(strip_grammar_residue(segment.trim()));
+        !peeled.complete || !peeled.executed.is_empty()
+    })
 }
 
 fn check_shell_wrapper_permissions(
@@ -2435,7 +2478,6 @@ mod tests {
             "env rtk rm X",
             "command rtk rm X",
             "exec rtk rm X",
-            "sudo rtk rm X",
             "/usr/local/bin/rtk rm X",
             "./rtk rm X",
             "\"rtk\" rm X",

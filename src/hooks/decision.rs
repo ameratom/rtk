@@ -212,10 +212,29 @@ pub(crate) fn decide_for_agent_at(
     if cwd.is_some_and(in_claude_worktree) {
         excluded.push("git".to_string());
     }
-    suppress_identity(
-        cmd,
-        decide_with_params(cmd, verdict, &excluded, &transparent_prefixes),
-    )
+    let decision = decide_with_params(cmd, verdict, &excluded, &transparent_prefixes);
+    if keeps_identity_prompt(cmd, verdict) {
+        return decision;
+    }
+    suppress_identity(cmd, decision)
+}
+
+/// Whether an identity rewrite of `cmd` must reach the host as a prompt
+/// rather than be suppressed into a [`HookDecision::Defer`] (#3970).
+///
+/// Suppressed, the host judges the literal `rtk …` text, so a host allow
+/// rule for `rtk` would auto-allow it. That is wrong when an ask rule matched
+/// the command behind the prefix, and when rtk only passes that command
+/// through or runs it on request with no allow rule of its own (the gate's
+/// [`PermissionVerdict::Default`]). A deny is already a
+/// [`HookDecision::Deny`] and an allow is not suppressed into anything
+/// looser, so both pass through untouched.
+fn keeps_identity_prompt(cmd: &str, verdict: PermissionVerdict) -> bool {
+    match verdict {
+        PermissionVerdict::Ask => true,
+        PermissionVerdict::Default => super::permissions::hands_on_rtk_command(cmd),
+        _ => false,
+    }
 }
 
 /// Whether `cwd` is inside a worktree Claude Code manages
