@@ -211,7 +211,7 @@ pub(crate) fn check_command_with_rules_and_prefixes(
             // allowed (#3970).
             let matched = allowed(segment)
                 && peeled.as_ref().is_none_or(|peeled| {
-                    peeled.complete && peeled.executed.iter().all(|inner| allowed(inner))
+                    !peeled.unread_rtk && peeled.executed.iter().all(|inner| allowed(inner))
                 });
             if !matched {
                 all_segments_allowed = false;
@@ -253,7 +253,7 @@ pub(crate) fn behind_rtk_prefix(cmd: &str) -> bool {
 pub(crate) fn hands_on_rtk_command(cmd: &str) -> bool {
     split_compound_command(cmd).iter().any(|segment| {
         let peeled = matching_readings(strip_grammar_residue(segment.trim()));
-        !peeled.complete || !peeled.executed.is_empty()
+        peeled.unread_rtk || !peeled.executed.is_empty()
     })
 }
 

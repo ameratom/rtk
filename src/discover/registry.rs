@@ -2160,10 +2160,11 @@ pub(crate) fn matching_readings(cmd: &str) -> MatchingReadings<'_> {
     let mut readings = vec![cmd.trim()];
     let mut executed = Vec::new();
     let mut rest = cmd.trim();
-    let done = |readings, executed, complete| MatchingReadings {
+    let done = |readings, executed, complete, unread_rtk| MatchingReadings {
         readings,
         executed,
         complete,
+        unread_rtk,
     };
     loop {
         let before = rest;
@@ -2176,7 +2177,7 @@ pub(crate) fn matching_readings(cmd: &str) -> MatchingReadings<'_> {
             let inner = match step {
                 PeelStep::Rtk => match peel_rtk(rest) {
                     None => None,
-                    Some(RtkPeel::Unreadable) => return done(readings, executed, false),
+                    Some(RtkPeel::Unreadable) => return done(readings, executed, false, true),
                     Some(RtkPeel::Native(inner)) => Some(inner),
                     Some(RtkPeel::Passthrough(inner)) => {
                         executed.push(inner);
@@ -2187,14 +2188,14 @@ pub(crate) fn matching_readings(cmd: &str) -> MatchingReadings<'_> {
             };
             if let Some(inner) = inner {
                 if readings.len() > MAX_MATCHING_PEELS {
-                    return done(readings, executed, false);
+                    return done(readings, executed, false, false);
                 }
                 rest = inner;
                 readings.push(rest);
             }
         }
         if rest == before {
-            return done(readings, executed, true);
+            return done(readings, executed, true, false);
         }
     }
 }
@@ -2257,6 +2258,9 @@ pub(crate) struct MatchingReadings<'a> {
     /// left, or at an `rtk` line whose executed command cannot be read
     /// ([`RtkPeel::Unreadable`]): the innermost command was not read.
     pub(crate) complete: bool,
+    /// True when the peel stopped at an `rtk` line whose executed command it
+    /// could not read ([`RtkPeel::Unreadable`]); such a line is never allowed.
+    pub(crate) unread_rtk: bool,
 }
 
 /// What an `rtk …` line hands to the system once rtk parses it (#3970).
