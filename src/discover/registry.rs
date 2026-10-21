@@ -2340,10 +2340,64 @@ pub(crate) fn peel_rtk(cmd: &str) -> Option<RtkPeel<'_>> {
                 return Some(RtkPeel::Passthrough(rest_from(token)));
             }
         }
+        // The runners that execute a command they are handed and only filter
+        // its output (#3970): argv runs directly, `--shell <SH>` runs one
+        // quoted script through that shell.
+        "err" | "summary" | "test" => Some(
+            peel_runner(cmd, &tokens, idx + 1, sub.value == "test")
+                .unwrap_or(RtkPeel::Native(rest_from(sub))),
+        ),
         name if RTK_SUBCOMMANDS.iter().any(|known| known == name) => {
             Some(RtkPeel::Native(rest_from(sub)))
         }
         _ => Some(RtkPeel::Passthrough(rest_from(sub))),
+    }
+}
+
+/// The command `rtk err|summary|test` runs, reading its arguments from
+/// `idx`; `None` when it was handed none (`rtk test` alone runs rtk's own
+/// default). Fail-safe: a word it cannot place is read as the command, which
+/// then needs an allow of its own. `negates` skips the `!` that `rtk test ! <cmd>` reads as
+/// negation of the command's exit status.
+fn peel_runner<'a>(
+    cmd: &'a str,
+    tokens: &[ParsedToken],
+    mut idx: usize,
+    negates: bool,
+) -> Option<RtkPeel<'a>> {
+    let mut shell = false;
+    loop {
+        let token = tokens.get(idx)?;
+        if negates && token.kind == TokenKind::Shellism && token.value == "!" {
+            idx += 1;
+            continue;
+        }
+        if token.kind != TokenKind::Arg {
+            // Not a word rtk is handed as written (a glob, `(`, an operator):
+            // the command it runs cannot be read, so never fall back to Native.
+            return Some(RtkPeel::Unreadable);
+        }
+        let arg = token.value.as_str();
+        if arg == "--shell" {
+            shell = true;
+            idx += 2;
+            continue;
+        }
+        if arg.starts_with("--shell=") {
+            shell = true;
+            idx += 1;
+            continue;
+        }
+        // Clap reads a leading hyphen word as the command itself (it allows
+        // hyphen values), so only rtk's own flags and `--` are skipped.
+        if arg == "--skip-env" || arg == "--" {
+            idx += 1;
+            continue;
+        }
+        if shell {
+            return Some(script_reading(cmd, token));
+        }
+        return Some(RtkPeel::Passthrough(cmd[token.offset..].trim()));
     }
 }
 
