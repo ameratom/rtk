@@ -2581,4 +2581,79 @@ mod tests {
         // bare `gain` / `read f`. That is pinned by rewrite_command, not by
         // the permission verdict — see rewrite_cmd::test_run_already_rtk_returns_some.
     }
+
+    /// `rtk err|summary|test` run the command they are handed (#3970 round 2).
+    fn rtk_runner_rm_cases() -> &'static [&'static str] {
+        &[
+            "rtk err rm X",
+            "rtk summary rm X",
+            "rtk test rm X",
+            "rtk -v err rm X",
+            "rtk err --skip-env rm X",
+            "rtk err -- rm X",
+            "rtk test ! rm X",
+            "rtk err --shell bash 'rm X'",
+            "rtk summary --shell=sh 'rm X'",
+            "rtk test --shell bash \"rm X\"",
+            "rtk err rtk rm X",
+            "rtk proxy rtk err rm X",
+        ]
+    }
+
+    #[test]
+    fn rtk_runner_with_inner_deny_is_deny() {
+        let (deny, ask, allow) = rtk_allow_rm_deny();
+        for cmd in rtk_runner_rm_cases() {
+            assert_eq!(
+                check_command_with_rules(cmd, &deny, &ask, &allow),
+                PermissionVerdict::Deny,
+                "runner must be judged on the command it runs: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn rtk_runner_with_ask_inner_is_ask() {
+        let ask = vec!["rm:*".to_string()];
+        let allow = vec!["rtk:*".to_string()];
+        for cmd in rtk_runner_rm_cases() {
+            assert_eq!(
+                check_command_with_rules(cmd, &[], &ask, &allow),
+                PermissionVerdict::Ask,
+                "ask on the runner's command must surface: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn rtk_runner_needs_its_own_allow() {
+        let rtk_only = vec!["rtk:*".to_string()];
+        let with_cargo = vec!["rtk:*".to_string(), "cargo test:*".to_string()];
+        for cmd in [
+            "rtk test cargo test",
+            "rtk err cargo test",
+            "rtk summary cargo test",
+        ] {
+            assert_ne!(
+                check_command_with_rules(cmd, &[], &[], &rtk_only),
+                PermissionVerdict::Allow,
+                "rtk:* alone must not grant the runner's command: {cmd}"
+            );
+            assert_eq!(
+                check_command_with_rules(cmd, &[], &[], &with_cargo),
+                PermissionVerdict::Allow,
+                "an allow for the runner's command grants it: {cmd}"
+            );
+        }
+        // A runner script with operators cannot be read back: never Allow.
+        assert_ne!(
+            check_command_with_rules(
+                "rtk err --shell bash 'cargo test && rm X'",
+                &[],
+                &[],
+                &with_cargo
+            ),
+            PermissionVerdict::Allow
+        );
+    }
 }

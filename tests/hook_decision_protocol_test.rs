@@ -1051,4 +1051,33 @@ mod rtk_prefixed_verdict {
             "expected a host-visible deny/ask/unwrap, got: {stdout}"
         );
     }
+
+    #[test]
+    fn rewrite_denies_rtk_runner_rm() {
+        let sb = deny_rm_allow_rtk();
+        for cmd in [
+            "rtk err rm X",
+            "rtk summary rm X",
+            "rtk test rm X",
+            "rtk -v err rm X",
+            "rtk test ! rm X",
+            "rtk err --shell bash 'rm X'",
+            "rtk summary --shell=sh 'rm X'",
+        ] {
+            let (code, stdout) = sb.rewrite(cmd);
+            assert_eq!(
+                code, 2,
+                "runner deny must be exit 2: {cmd} (stdout={stdout:?})"
+            );
+            assert!(
+                stdout.is_empty(),
+                "deny prints nothing: {cmd} got {stdout:?}"
+            );
+            let hook = sb.hook_claude(cmd);
+            assert!(
+                hook.contains("deny"),
+                "claude hook must deny runner rm: {cmd} got {hook:?}"
+            );
+        }
+    }
 }
