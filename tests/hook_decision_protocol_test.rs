@@ -1080,4 +1080,62 @@ mod rtk_prefixed_verdict {
             );
         }
     }
+
+    fn claude_decision(stdout: &str) -> Option<String> {
+        if stdout.trim().is_empty() {
+            return None;
+        }
+        let v: serde_json::Value = serde_json::from_str(stdout).expect("hook emitted valid JSON");
+        v.pointer("/hookSpecificOutput/permissionDecision")
+            .and_then(|d| d.as_str())
+            .map(str::to_owned)
+    }
+
+    /// Hole B (#3970): an explicit ask rule on the command behind (or turned
+    /// into) an `rtk` prefix must reach Claude Code as `ask`. Omitting the
+    /// decision lets the host judge the literal `rtk …` text, and
+    /// `Bash(rtk:*)` auto-allows it.
+    #[test]
+    fn hook_claude_asserts_ask_when_ask_rule_matches_behind_rtk() {
+        let sb = Sandbox::with_rules(&[], &["git push:*"], &["rtk:*"]);
+        for cmd in ["rtk git push", "git push", "rtk proxy git push"] {
+            let stdout = sb.hook_claude(cmd);
+            assert_eq!(
+                claude_decision(&stdout).as_deref(),
+                Some("ask"),
+                "ask rule must surface as ask: {cmd} got {stdout:?}"
+            );
+        }
+    }
+
+    /// Hole B (#3970): `rtk run` spellings the gate cannot read must never
+    /// leave Claude Code silent when a deny rule exists.
+    #[test]
+    fn hook_claude_never_silent_for_unread_rtk_run_under_deny() {
+        let sb = deny_rm_allow_rtk();
+        for cmd in ["rtk run --command='rm X'", "rtk run -c rm\\ X"] {
+            let stdout = sb.hook_claude(cmd);
+            let decision = claude_decision(&stdout);
+            assert!(
+                matches!(decision.as_deref(), Some("ask") | Some("deny")),
+                "unread rtk run must ask or deny: {cmd} got {stdout:?}"
+            );
+            let (code, _) = sb.rewrite(cmd);
+            assert_ne!(code, 0, "rewrite must not auto-allow: {cmd}");
+        }
+    }
+
+    /// #3037 guard: a plain rewrite no rule matched carries no decision.
+    #[test]
+    fn hook_claude_default_rewrite_has_no_decision() {
+        let sb = Sandbox::with_rules(&[], &[], &[]);
+        let stdout = sb.hook_claude("git status");
+        assert!(!stdout.trim().is_empty(), "git status should rewrite");
+        assert_eq!(claude_decision(&stdout), None, "got {stdout:?}");
+        let allow = Sandbox::with_rules(&[], &[], &["git status:*"]);
+        assert_eq!(
+            claude_decision(&allow.hook_claude("git status")).as_deref(),
+            Some("allow")
+        );
+    }
 }
