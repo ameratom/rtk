@@ -699,11 +699,55 @@ fn process_claude_payload(v: &Value) -> PayloadAction {
     };
 
     let cwd = v.get("cwd").and_then(Value::as_str);
-    process_claude_payload_from_decision(
-        v,
-        cmd,
-        decide_hook_action(cmd, permissions::Host::Claude, cwd),
-    )
+    let verdict = permissions::check_command_for(cmd, permissions::Host::Claude);
+    let action =
+        process_claude_payload_from_decision(v, cmd, decide_from_verdict(cmd, verdict, cwd));
+    assert_claude_ask(v, cmd, verdict, action)
+}
+
+/// Whether Claude Code must be told `ask` for `rewritten` rather than left to
+/// judge it itself (#3970).
+///
+/// Claude Code judges the command the hook hands back. When that is an
+/// `rtk …` line, a `Bash(rtk:*)` allow rule auto-allows it, so a missing
+/// `permissionDecision` silently drops a prompt RTK's gate asked for. Two
+/// cases need it asserted: the gate said ask (an explicit ask rule, or a
+/// prefix it could not read to the end) and the host would see an rtk
+/// prefix; or no rule matched but rtk only passes on or runs a command it did
+/// not judge (`rtk run --command=…`). A plain rewrite no rule matched keeps no
+/// decision, so the host's own prompt and allowlist stay in control (#3037),
+/// and so does a rewrite the host still sees unprefixed, such as a shell
+/// wrapper's script.
+fn claude_must_ask(cmd: &str, rewritten: &str, verdict: PermissionVerdict) -> bool {
+    match verdict {
+        PermissionVerdict::Ask => permissions::behind_rtk_prefix(rewritten),
+        PermissionVerdict::Default => permissions::hands_on_rtk_command(cmd),
+        _ => false,
+    }
+}
+
+/// Upgrade an undecided Claude rewrite to an explicit `ask` when
+/// [`claude_must_ask`] says so. Allow, deny and skip outcomes pass through.
+fn assert_claude_ask(
+    v: &Value,
+    cmd: &str,
+    verdict: PermissionVerdict,
+    action: PayloadAction,
+) -> PayloadAction {
+    match action {
+        PayloadAction::Rewrite {
+            cmd: original,
+            rewritten,
+            decision: HookOutcome::Ask,
+            ..
+        } if claude_must_ask(cmd, &rewritten, verdict) => PayloadAction::Rewrite {
+            output: pre_tool_use_rewrite_output(v, &rewritten, Some("ask")),
+            cmd: original,
+            rewritten,
+            decision: HookOutcome::Ask,
+        },
+        other => other,
+    }
 }
 
 /// Pure core of `process_claude_payload`, taking the hook decision directly so the
