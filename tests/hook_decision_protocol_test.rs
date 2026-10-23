@@ -1081,6 +1081,33 @@ mod rtk_prefixed_verdict {
         }
     }
 
+    /// Hole C (#3970): `rtk npx|bunx|uv run|npm exec|pnpm dlx|bun x <cmd>`
+    /// runs `<cmd>`; a deny on it must hold behind the rtk prefix.
+    #[test]
+    fn rewrite_denies_rtk_package_runner_rm() {
+        let sb = deny_rm_allow_rtk();
+        for cmd in [
+            "rtk npx rm X",
+            "rtk uv run rm X",
+            "rtk npm exec rm X",
+            "rtk pnpm dlx rm X",
+            "rtk bunx rm X",
+            "rtk bun x rm X",
+            "rtk npx -c 'rm X'",
+        ] {
+            let (code, stdout) = sb.rewrite(cmd);
+            assert_eq!(
+                code, 2,
+                "package runner deny must be exit 2: {cmd} (stdout={stdout:?})"
+            );
+            let hook = sb.hook_claude(cmd);
+            assert!(
+                hook.contains("deny"),
+                "claude hook must deny package runner rm: {cmd} got {hook:?}"
+            );
+        }
+    }
+
     fn claude_decision(stdout: &str) -> Option<String> {
         if stdout.trim().is_empty() {
             return None;

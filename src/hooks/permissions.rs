@@ -2656,4 +2656,108 @@ mod tests {
             PermissionVerdict::Allow
         );
     }
+
+    /// Hole C (#3970): rtk's package runners execute the command they are
+    /// handed (`rtk npx rm X` runs `npx rm X`, which runs `rm X`), so that
+    /// command is judged like any other passthrough.
+    fn rtk_package_runner_rm_cases() -> Vec<&'static str> {
+        vec![
+            "rtk npx rm X",
+            "rtk npx -y rm X",
+            "rtk npx --yes -- rm X",
+            "rtk npx -p cowsay rm X",
+            "rtk npx --package=cowsay rm X",
+            "rtk npx -c 'rm X'",
+            "rtk bunx rm X",
+            "rtk bunx --bun rm X",
+            "rtk uv run rm X",
+            "rtk uv run -- rm X",
+            "rtk uv tool run rm X",
+            "rtk npm exec rm X",
+            "rtk npm exec -- rm X",
+            "rtk npm x rm X",
+            "rtk npm exec -c 'rm X'",
+            "rtk pnpm dlx rm X",
+            "rtk pnpm exec rm X",
+            "rtk pnpm -r exec rm X",
+            "rtk bun x rm X",
+            "rtk npx rtk rm X",
+            "rtk uv run env rm X",
+            "rtk proxy rtk npx rm X",
+        ]
+    }
+
+    #[test]
+    fn rtk_package_runner_with_inner_deny_is_deny() {
+        let (deny, ask, allow) = rtk_allow_rm_deny();
+        for cmd in rtk_package_runner_rm_cases() {
+            assert_eq!(
+                check_command_with_rules(cmd, &deny, &ask, &allow),
+                PermissionVerdict::Deny,
+                "package runner must be judged on the command it runs: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn rtk_package_runner_with_ask_inner_is_ask() {
+        let ask = vec!["rm:*".to_string()];
+        let allow = vec!["rtk:*".to_string()];
+        for cmd in rtk_package_runner_rm_cases() {
+            assert_eq!(
+                check_command_with_rules(cmd, &[], &ask, &allow),
+                PermissionVerdict::Ask,
+                "ask on the package runner's command must surface: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn rtk_package_runner_needs_its_own_allow() {
+        let rtk_only = vec!["rtk:*".to_string()];
+        for cmd in [
+            "rtk npx rm X",
+            "rtk uv run rm X",
+            "rtk npm exec rm X",
+            "rtk pnpm dlx rm X",
+            "rtk bunx rm X",
+            "rtk npx tsc --noEmit",
+            "rtk uv run pytest",
+            // Options rtk cannot place (value-taking or unknown) make the
+            // payload unreadable: never Allow, even if a word looks harmless.
+            "rtk uv run --with rm X",
+            "rtk uv --project app run rm X",
+            "rtk npx --unknown-flag rm X",
+        ] {
+            assert_ne!(
+                check_command_with_rules(cmd, &[], &[], &rtk_only),
+                PermissionVerdict::Allow,
+                "rtk:* alone must not grant the package runner's command: {cmd}"
+            );
+        }
+        let with_tsc = vec!["rtk:*".to_string(), "tsc:*".to_string()];
+        assert_eq!(
+            check_command_with_rules("rtk npx tsc --noEmit", &[], &[], &with_tsc),
+            PermissionVerdict::Allow,
+            "an allow for the runner's command grants it"
+        );
+        let with_pytest = vec!["rtk:*".to_string(), "pytest:*".to_string()];
+        assert_eq!(
+            check_command_with_rules("rtk uv run pytest -q", &[], &[], &with_pytest),
+            PermissionVerdict::Allow
+        );
+        // rtk's own non-runner uv/npm/pnpm filters stay granted by rtk:*.
+        for cmd in [
+            "rtk npm run build",
+            "rtk pnpm install",
+            "rtk uv pip list",
+            "rtk npm test",
+        ] {
+            assert_eq!(
+                check_command_with_rules(cmd, &[], &[], &rtk_only),
+                PermissionVerdict::Allow,
+                "non-runner filter must stay allowed: {cmd}"
+            );
+        }
+    }
 }
