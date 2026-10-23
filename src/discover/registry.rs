@@ -2347,10 +2347,132 @@ pub(crate) fn peel_rtk(cmd: &str) -> Option<RtkPeel<'_>> {
             peel_runner(cmd, &tokens, idx + 1, sub.value == "test")
                 .unwrap_or(RtkPeel::Native(rest_from(sub))),
         ),
-        name if RTK_SUBCOMMANDS.iter().any(|known| known == name) => {
-            Some(RtkPeel::Native(rest_from(sub)))
-        }
+        name if RTK_SUBCOMMANDS.iter().any(|known| known == name) => Some(
+            peel_package_runner(cmd, &tokens, idx, name).unwrap_or(RtkPeel::Native(rest_from(sub))),
+        ),
         _ => Some(RtkPeel::Passthrough(rest_from(sub))),
+    }
+}
+
+/// How a package runner reads the options in front of the command it runs.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RunnerFlags {
+    /// `npx`, `npm exec`/`npm x`: `-p`/`--package` take a value, `-c`/`--call`
+    /// take a shell script.
+    Npx,
+    /// `bunx`, `bun x`: `-p`/`--package` take a value.
+    Bunx,
+    /// `pnpm dlx`/`pnpm exec`: `--package` takes a value; `-c`/`--shell-mode`
+    /// hand the rest to a shell, which is never read back.
+    Pnpm,
+    /// `uv run`/`uv tool run`: most options take values; none is read.
+    Uv,
+}
+
+/// The command one of rtk's package runners executes (#3970 hole C):
+/// `rtk npx rm x` runs `npx rm x`, which runs `rm x`, so `Bash(rtk:*)` must
+/// not grant it. `sub` is the subcommand at `tokens[idx]`. `None` when the
+/// line is one of rtk's own filters for that tool (`rtk npm run build`,
+/// `rtk uv pip list`), which stay [`RtkPeel::Native`].
+fn peel_package_runner<'a>(
+    cmd: &'a str,
+    tokens: &[ParsedToken],
+    idx: usize,
+    sub: &str,
+) -> Option<RtkPeel<'a>> {
+    let word = |i: usize| arg_token(tokens, i).map(|t| t.value.as_str());
+    // A runner keyword reached only after tool options rtk does not read:
+    // the command it runs cannot be placed, so it is never Native.
+    let unplaced = |from: usize, keywords: &[&str]| {
+        word(from).is_some_and(|w| w.starts_with('-'))
+            && tokens[from..]
+                .iter()
+                .any(|t| t.kind == TokenKind::Arg && keywords.contains(&t.value.as_str()))
+    };
+    match sub {
+        "npx" => peel_runner_payload(cmd, tokens, idx + 1, RunnerFlags::Npx),
+        "bunx" => peel_runner_payload(cmd, tokens, idx + 1, RunnerFlags::Bunx),
+        "bun" => match word(idx + 1) {
+            Some("x") => peel_runner_payload(cmd, tokens, idx + 2, RunnerFlags::Bunx),
+            _ if unplaced(idx + 1, &["x"]) => Some(RtkPeel::Unreadable),
+            _ => None,
+        },
+        "npm" => match word(idx + 1) {
+            Some("exec" | "x") => peel_runner_payload(cmd, tokens, idx + 2, RunnerFlags::Npx),
+            _ if unplaced(idx + 1, &["exec", "x"]) => Some(RtkPeel::Unreadable),
+            _ => None,
+        },
+        "uv" => match (word(idx + 1), word(idx + 2)) {
+            (Some("run"), _) => peel_runner_payload(cmd, tokens, idx + 2, RunnerFlags::Uv),
+            (Some("tool"), Some("run")) => {
+                peel_runner_payload(cmd, tokens, idx + 3, RunnerFlags::Uv)
+            }
+            _ if unplaced(idx + 1, &["run"]) => Some(RtkPeel::Unreadable),
+            _ => None,
+        },
+        "pnpm" => {
+            // rtk's own pnpm flags (`-F`/`--filter` take a value).
+            let mut i = idx + 1;
+            loop {
+                match word(i) {
+                    Some("-F" | "--filter") => i += 2,
+                    Some(w) if w.starts_with("--filter=") => i += 1,
+                    Some("-r" | "--recursive" | "-w" | "--workspace-root") => i += 1,
+                    _ => break,
+                }
+            }
+            match word(i) {
+                Some("dlx" | "exec") => peel_runner_payload(cmd, tokens, i + 1, RunnerFlags::Pnpm),
+                _ if unplaced(i, &["dlx", "exec"]) => Some(RtkPeel::Unreadable),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// The command a package runner runs, reading its options from `idx`.
+/// Fail-safe: an option this reader does not know makes the line
+/// [`RtkPeel::Unreadable`] rather than guessing which word is the command.
+fn peel_runner_payload<'a>(
+    cmd: &'a str,
+    tokens: &[ParsedToken],
+    mut idx: usize,
+    flags: RunnerFlags,
+) -> Option<RtkPeel<'a>> {
+    let mut options_done = false;
+    loop {
+        // `rtk npx` alone runs nothing (rtk refuses); leave it Native.
+        let token = tokens.get(idx)?;
+        if token.kind != TokenKind::Arg {
+            return Some(RtkPeel::Unreadable);
+        }
+        let arg = token.value.as_str();
+        if options_done || !arg.starts_with('-') {
+            return Some(RtkPeel::Passthrough(cmd[token.offset..].trim()));
+        }
+        match (flags, arg) {
+            (_, "--") => {
+                options_done = true;
+                idx += 1;
+            }
+            (RunnerFlags::Npx | RunnerFlags::Bunx, "-p" | "--package")
+            | (RunnerFlags::Pnpm, "--package") => idx += 2,
+            (RunnerFlags::Npx | RunnerFlags::Bunx | RunnerFlags::Pnpm, a)
+                if a.starts_with("--package=") =>
+            {
+                idx += 1
+            }
+            (RunnerFlags::Npx, "-c" | "--call") => {
+                return Some(
+                    arg_token(tokens, idx + 1)
+                        .map_or(RtkPeel::Unreadable, |script| script_reading(cmd, script)),
+                );
+            }
+            (RunnerFlags::Npx, "-y" | "--yes" | "--no" | "-q" | "--quiet")
+            | (RunnerFlags::Bunx, "--bun" | "--silent") => idx += 1,
+            _ => return Some(RtkPeel::Unreadable),
+        }
     }
 }
 
