@@ -1093,6 +1093,8 @@ mod rtk_prefixed_verdict {
             "rtk pnpm dlx rm X",
             "rtk bunx rm X",
             "rtk bun x rm X",
+            "rtk bun run rm X",
+            "rtk bun exec 'rm X'",
             "rtk npx -c 'rm X'",
         ] {
             let (code, stdout) = sb.rewrite(cmd);
