@@ -2360,7 +2360,7 @@ enum RunnerFlags {
     /// `npx`, `npm exec`/`npm x`: `-p`/`--package` take a value, `-c`/`--call`
     /// take a shell script.
     Npx,
-    /// `bunx`, `bun x`: `-p`/`--package` take a value.
+    /// `bunx`, `bun x`, `bun run`: `-p`/`--package` take a value.
     Bunx,
     /// `pnpm dlx`/`pnpm exec`: `--package` takes a value; `-c`/`--shell-mode`
     /// hand the rest to a shell, which is never read back.
@@ -2392,9 +2392,16 @@ fn peel_package_runner<'a>(
     match sub {
         "npx" => peel_runner_payload(cmd, tokens, idx + 1, RunnerFlags::Npx),
         "bunx" => peel_runner_payload(cmd, tokens, idx + 1, RunnerFlags::Bunx),
+        // `bun run <name>` falls back to any executable on PATH when no
+        // package script or bin has that name (verified: `bun run rm f`
+        // deletes `f`), and `bun exec '<script>'` runs a shell script.
         "bun" => match word(idx + 1) {
-            Some("x") => peel_runner_payload(cmd, tokens, idx + 2, RunnerFlags::Bunx),
-            _ if unplaced(idx + 1, &["x"]) => Some(RtkPeel::Unreadable),
+            Some("x" | "run") => peel_runner_payload(cmd, tokens, idx + 2, RunnerFlags::Bunx),
+            Some("exec") => Some(
+                arg_token(tokens, idx + 2)
+                    .map_or(RtkPeel::Unreadable, |script| script_reading(cmd, script)),
+            ),
+            _ if unplaced(idx + 1, &["x", "run", "exec"]) => Some(RtkPeel::Unreadable),
             _ => None,
         },
         "npm" => match word(idx + 1) {
